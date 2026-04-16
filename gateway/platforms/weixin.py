@@ -621,25 +621,58 @@ def _rewrite_table_block_for_weixin(lines: List[str]) -> str:
 
 
 def _normalize_markdown_blocks(content: str) -> str:
+    """Convert Markdown to WeChat-friendly formatted text.
+
+    WeChat doesn't support Markdown rendering, so we transform to visual
+    equivalents using Unicode symbols and text formatting:
+
+    - # 标题 → 【标题】
+    - ## 标题 → ▸ 标题
+    - **粗体** → 「粗体」
+    - *斜体* → 「斜体」
+    - `代码` → 「代码」
+    - ```代码块``` │ 缩进代码块
+    - [链接](url) → 链接 (url)
+    - 表格 → 列表格式
+    """
     lines = content.splitlines()
     result: List[str] = []
     i = 0
     in_code_block = False
+    code_block_lines: List[str] = []
 
     while i < len(lines):
-        line = lines[i].rstrip()
-        fence_match = _FENCE_RE.match(line.strip())
+        line = lines[i]
+        stripped = line.strip()
+        fence_match = _FENCE_RE.match(stripped)
+
         if fence_match:
-            in_code_block = not in_code_block
-            result.append(line)
+            if in_code_block:
+                # 结束代码块 - 格式化输出
+                if code_block_lines:
+                    # 添加顶部边框
+                    max_len = max(len(l) for l in code_block_lines) if code_block_lines else 0
+                    border = "┌" + "─" * min(max_len + 2, 60) + "┐"
+                    result.append(border)
+                    # 添加代码行，带左边框
+                    for code_line in code_block_lines:
+                        result.append("│ " + code_line)
+                    # 添加底部边框
+                    result.append("└" + "─" * min(max_len + 2, 60) + "┘")
+                code_block_lines = []
+                in_code_block = False
+            else:
+                # 开始代码块
+                in_code_block = True
             i += 1
             continue
 
         if in_code_block:
-            result.append(line)
+            code_block_lines.append(line.rstrip())
             i += 1
             continue
 
+        # 检测表格
         if (
             i + 1 < len(lines)
             and "|" in lines[i]
@@ -653,10 +686,40 @@ def _normalize_markdown_blocks(content: str) -> str:
             result.append(_rewrite_table_block_for_weixin(table_lines))
             continue
 
-        result.append(_MARKDOWN_LINK_RE.sub(r"\1 (\2)", _rewrite_headers_for_weixin(line)))
+        # 处理标题 - 保留原有的转换
+        header_match = _HEADER_RE.match(stripped)
+        if header_match:
+            level = len(header_match.group(1))
+            title = header_match.group(2).strip()
+            if level == 1:
+                result.append(f"【{title}】")
+            elif level == 2:
+                result.append(f"▸ {title}")
+            else:
+                result.append(f"  ◇ {title}")
+            i += 1
+            continue
+
+        # 处理链接
+        line = _MARKDOWN_LINK_RE.sub(r"\1 (\2)", line)
+
+        # 处理行内格式（粗体、斜体、代码）
+        # 注意：不在列表项开头处理（保留 * - + 作为列表标记）
+        is_list_item = stripped.startswith(("* ", "- ", "+ ")) or re.match(r"^\d+\.\s", stripped)
+
+        if not is_list_item:
+            # 处理 **粗体** → 「粗体」
+            line = re.sub(r"\*\*([^*]+?)\*\*", r"「\1」", line)
+            # 处理 *斜体* → 「斜体」
+            line = re.sub(r"(?<!\*)\*(?!\*)([^*\n]+?)(?<!\*)\*(?!\*)", r"「\1」", line)
+
+        # 处理 `行内代码` → 「代码」（全局处理）
+        line = re.sub(r"`([^`]+?)`", r"「\1」", line)
+
+        result.append(line.rstrip())
         i += 1
 
-    normalized = "\n".join(item.rstrip() for item in result)
+    normalized = "\n".join(item for item in result if item is not None)
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
 
@@ -775,25 +838,74 @@ def _should_split_short_chat_block_for_weixin(block: str) -> bool:
 
 
 def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]:
+    """Pack content into chunks suitable for WeChat delivery.
+
+    Each chunk will be at most max_length characters. When content must
+    be split, each chunk gets a clear indicator like [1/3] at the end.
+    """
+    if not content:
+        return []
+
     if len(content) <= max_length:
         return [content]
 
+    # Reserve space for indicator like " [1/10]"
+    INDICATOR_RESERVE = 8
+    effective_max = max(max_length - INDICATOR_RESERVE, 100)  # 至少 100 字符
+
     packed: List[str] = []
     current = ""
+
     for block in _split_markdown_blocks(content):
+        if not block:
+            continue
+
         candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= max_length:
+        if len(candidate) <= effective_max:
             current = candidate
             continue
+
         if current:
             packed.append(current)
             current = ""
-        if len(block) <= max_length:
+
+        if len(block) <= effective_max:
             current = block
             continue
-        packed.extend(BasePlatformAdapter.truncate_message(block, max_length))
+
+        # Block is too large, need to split
+        remaining = block
+        while remaining and len(remaining) > effective_max:
+            # Find a good break point
+            break_pos = min(effective_max, len(remaining))
+            # Try to break at sentence/paragraph boundary (search backwards)
+            search_start = min(effective_max, len(remaining) - 1)
+            search_end = max(0, effective_max - 100)
+            for search_pos in range(search_start, search_end, -1):
+                char = remaining[search_pos]
+                if char in "\n。！？.!?：:":
+                    break_pos = search_pos + 1
+                    break
+
+            # Ensure we make progress
+            if break_pos <= 0:
+                break_pos = min(effective_max, len(remaining))
+
+            packed.append(remaining[:break_pos].rstrip())
+            remaining = remaining[break_pos:].lstrip()
+
+        if remaining:
+            current = remaining
+
     if current:
         packed.append(current)
+
+    # Add clear indicators to each chunk
+    total = len(packed)
+    if total > 1:
+        for i, chunk in enumerate(packed):
+            packed[i] = f"{chunk} [{i + 1}/{total}]"
+
     return packed
 
 
