@@ -773,8 +773,47 @@ DEFAULT_CONFIG = {
     "network": {
         # Force IPv4 connections.  On servers with broken or unreachable IPv6,
         # Python tries AAAA records first and hangs for the full TCP timeout
-        # before falling back to IPv4.  Set to true to skip IPv6 entirely.
+        # before falling back to IPv4.  Set to true to skip IPv4 entirely.
         "force_ipv4": False,
+    },
+
+    # Multi-Agent mode — 三省六部多Agent协作系统
+    # 启用后，用户消息将通过多层Agent协作处理
+    "multi_agent": {
+        "enabled": False,  # 是否启用多Agent模式
+        "mode": "default",  # "default" (单Agent) | "three_provinces" (三省六部)
+
+        # Agent 配置 — 可为特定Agent指定模型
+        "agents": {
+            "taizi": {"enabled": True, "model": ""},      # 太子 - 消息分类
+            "zhongshu": {"enabled": True, "model": ""},   # 中书省 - 规划决策
+            "menxia": {"enabled": True, "model": ""},     # 门下省 - 审议把关
+            "shangshu": {"enabled": True, "model": ""},   # 尚书省 - 执行派发
+            "hubu": {"enabled": True, "model": ""},       # 户部 - 数据/报表
+            "bingbu": {"enabled": True, "model": ""},     # 兵部 - 基础设施
+            "libu": {"enabled": True, "model": ""},       # 礼部 - 文档/UI
+            "xingbu": {"enabled": True, "model": ""},     # 刑部 - 测试/合规
+            "gongbu": {"enabled": True, "model": ""},     # 工部 - 开发/代码
+            "libu_hr": {"enabled": True, "model": ""},    # 吏部 - 配置管理
+            "zaochao": {"enabled": True, "model": ""},    # 早朝官 - 定时任务
+        },
+
+        # 工作流配置
+        "workflow": {
+            "max_review_rounds": 3,      # 最大审议轮数
+            "auto_approve_final": True,  # 最后一轮是否自动通过
+            "timeout_per_agent": 300,    # 每个Agent的超时时间(秒)
+        },
+
+        # 状态存储配置
+        "state": {
+            "backend": "sqlite",  # "sqlite" (默认) | "redis" (可选)
+        },
+
+        # 事件总线配置
+        "event_bus": {
+            "backend": "memory",  # "memory" (默认) | "redis" (可选)
+        },
     },
 
     # Config schema version - bump this when adding new required fields

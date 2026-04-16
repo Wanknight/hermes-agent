@@ -598,6 +598,7 @@ class AIAgent:
         gateway_session_key: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
+        skip_multi_agent: bool = False,  # 跳过多Agent模式检查（子Agent使用）
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -669,6 +670,7 @@ class AIAgent:
         self._print_fn = None
         self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
+        self._skip_multi_agent = skip_multi_agent  # 子Agent跳过多Agent检查
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
@@ -8281,6 +8283,17 @@ class AIAgent:
             _msg_preview,
         )
 
+        # ── 多Agent模式判断 ─────────────────────────────────────────────
+        # 如果启用三省六部模式，使用 orchestrator 处理消息
+        if self._should_use_multi_agent():
+            logger.info("Using multi-agent mode (three_provinces)")
+            return self._run_multi_agent_conversation(
+                user_message=user_message,
+                persist_user_message=persist_user_message,
+                task_id=effective_task_id,
+            )
+        # ─────────────────────────────────────────────────────────────────
+
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
 
@@ -11301,6 +11314,94 @@ class AIAgent:
             logger.warning("on_session_end hook failed: %s", exc)
 
         return result
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 多Agent模式支持
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _should_use_multi_agent(self) -> bool:
+        """判断是否应该使用多Agent模式"""
+        # 子Agent跳过多Agent模式检查，防止递归
+        if getattr(self, '_skip_multi_agent', False):
+            return False
+        
+        try:
+            from multi_agent import MultiAgentOrchestrator
+            orchestrator = MultiAgentOrchestrator()
+            return orchestrator.is_enabled()
+        except Exception as e:
+            logger.debug(f"Failed to check multi-agent mode: {e}")
+            return False
+
+    def _run_multi_agent_conversation(
+        self,
+        user_message: str,
+        persist_user_message: str = None,
+        task_id: str = None,
+    ) -> Dict[str, Any]:
+        """运行多Agent对话
+
+        Args:
+            user_message: 用户消息
+            persist_user_message: 持久化消息（可选）
+            task_id: 任务ID
+
+        Returns:
+            对话结果字典
+        """
+        from multi_agent import MultiAgentOrchestrator
+
+        # 获取或创建 orchestrator
+        if not hasattr(self, '_multi_agent_orchestrator') or self._multi_agent_orchestrator is None:
+            self._multi_agent_orchestrator = MultiAgentOrchestrator(
+                parent_agent=self,
+            )
+            # 如果有预设的 notification callback，设置到 orchestrator
+            if hasattr(self, '_notification_callback') and self._notification_callback:
+                self._multi_agent_orchestrator.set_notification_callback(self._notification_callback)
+        else:
+            self._multi_agent_orchestrator.set_parent_agent(self)
+            # 确保 notification callback 是最新的
+            if hasattr(self, '_notification_callback') and self._notification_callback:
+                self._multi_agent_orchestrator.set_notification_callback(self._notification_callback)
+
+        # 处理消息
+        try:
+            response = self._multi_agent_orchestrator.process_message(user_message)
+
+            # 持久化会话
+            original_message = persist_user_message if persist_user_message is not None else user_message
+            self._persist_multi_agent_session(original_message, response)
+
+            return {
+                "final_response": response,
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+            }
+        except Exception as e:
+            logger.error(f"Multi-agent conversation failed: {e}", exc_info=True)
+            return {
+                "final_response": f"多Agent模式执行出错: {e}",
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": str(e),
+            }
+
+    def _persist_multi_agent_session(self, user_message: str, response: str):
+        """持久化多Agent会话"""
+        # 添加到会话历史
+        if hasattr(self, 'conversation_history') and isinstance(self.conversation_history, list):
+            self.conversation_history.append({
+                "role": "user",
+                "content": user_message,
+            })
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": response,
+            })
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

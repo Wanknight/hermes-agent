@@ -5433,6 +5433,14 @@ class HermesCLI:
             self._handle_model_switch(cmd_original)
         elif canonical == "provider":
             self._show_model_and_providers()
+        elif canonical == "mode":
+            self._handle_mode_command(cmd_original)
+        elif canonical == "tasks":
+            self._handle_tasks_command(cmd_original)
+        elif canonical == "circuit-breaker":
+            self._handle_circuit_breaker_command(cmd_original)
+        elif canonical == "events":
+            self._handle_events_command(cmd_original)
 
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
@@ -6331,6 +6339,461 @@ class HermesCLI:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (saved to config){_RST}")
         else:
             _cprint(f"  {_ACCENT}✓ {feature_name} set to {label} (session only){_RST}")
+
+    def _handle_mode_command(self, cmd: str):
+        """Handle /mode — switch between single-agent and multi-agent (三省六部) modes."""
+        from hermes_cli.config import load_config, save_config
+        
+        parts = cmd.strip().split(maxsplit=1)
+        
+        # Load current config
+        config = load_config()
+        multi_agent_config = config.get("multi_agent", {})
+        current_mode = multi_agent_config.get("mode", "default")
+        enabled = multi_agent_config.get("enabled", False)
+        
+        if len(parts) < 2 or parts[1].strip().lower() == "status":
+            # Show current status
+            if enabled and current_mode == "three_provinces":
+                status = "三省六部 (multi-agent)"
+                _cprint(f"  {_ACCENT}🛕 当前模式: {status}{_RST}")
+                _cprint(f"  {_DIM}多Agent协作已启用，消息将通过太子→中书省→门下省→尚书省→六部流程处理{_RST}")
+            else:
+                status = "默认 (single-agent)"
+                _cprint(f"  {_ACCENT}🤖 当前模式: {status}{_RST}")
+                _cprint(f"  {_DIM}单Agent模式，所有消息由一个Agent直接处理{_RST}")
+            _cprint(f"  {_DIM}用法: /mode [default|three_provinces|status]{_RST}")
+            return
+        
+        arg = parts[1].strip().lower()
+        
+        if arg in {"three_provinces", "on"}:
+            # Enable multi-agent mode
+            new_config = config.copy()
+            if "multi_agent" not in new_config:
+                new_config["multi_agent"] = {}
+            new_config["multi_agent"]["enabled"] = True
+            new_config["multi_agent"]["mode"] = "three_provinces"
+            
+            try:
+                save_config(new_config)
+                _cprint(f"  {_ACCENT}🛕 已切换到三省六部模式{_RST}")
+                _cprint(f"  {_DIM}消息将通过多层Agent协作处理：太子(分类)→中书省(规划)→门下省(审议)→尚书省(执行){_RST}")
+                _cprint(f"  {_DIM}使用 /mode default 切换回单Agent模式{_RST}")
+            except Exception as e:
+                _cprint(f"  {_DIM}(._.) 保存配置失败: {e}{_RST}")
+                
+        elif arg in {"default", "off"}:
+            # Disable multi-agent mode (back to single agent)
+            new_config = config.copy()
+            if "multi_agent" not in new_config:
+                new_config["multi_agent"] = {}
+            new_config["multi_agent"]["enabled"] = False
+            new_config["multi_agent"]["mode"] = "default"
+            
+            try:
+                save_config(new_config)
+                _cprint(f"  {_ACCENT}🤖 已切换到默认单Agent模式{_RST}")
+                _cprint(f"  {_DIM}消息将由单个Agent直接处理{_RST}")
+                _cprint(f"  {_DIM}使用 /mode three_provinces 启用多Agent协作模式{_RST}")
+            except Exception as e:
+                _cprint(f"  {_DIM}(._.) 保存配置失败: {e}{_RST}")
+                
+        else:
+            _cprint(f"  {_DIM}(._.) 未知参数: {arg}{_RST}")
+            _cprint(f"  {_DIM}用法: /mode [default|three_provinces|status]{_RST}")
+    
+    def _handle_tasks_command(self, cmd: str):
+        """Handle /tasks — list multi-agent tasks and their status."""
+        from multi_agent import MultiAgentOrchestrator, TaskStatus
+        
+        parts = cmd.strip().split(maxsplit=2)  # 支持最多3部分: /tasks <id> audit
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        sub_arg = parts[2].strip().lower() if len(parts) > 2 else ""
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            if arg == "stats":
+                # 显示统计信息
+                stats = orchestrator.get_statistics()
+                _cprint(f"  {_ACCENT}📊 多Agent任务统计{_RST}")
+                _cprint(f"  总任务数: {stats.get('total_tasks', 0)}")
+                _cprint(f"  已完成: {stats.get('completed_tasks', 0)}")
+                _cprint(f"  进行中: {stats.get('active_tasks', 0)}")
+                _cprint(f"  失败: {stats.get('failed_tasks', 0)}")
+                
+            elif arg and arg not in ("status", "list"):
+                # 查询特定任务
+                task_id = arg
+                
+                # 检查是否有 audit 子命令
+                if sub_arg == "audit":
+                    self._show_task_audit_logs(task_id)
+                    return
+                
+                task = orchestrator.get_task(task_id)
+                if task:
+                    _cprint(f"  {_ACCENT}📋 任务: {task.title or task_id}{_RST}")
+                    _cprint(f"  状态: {task.status.value}")
+                    _cprint(f"  类型: {task.message_type.value}")
+                    _cprint(f"  创建时间: {task.created_at}")
+                    
+                    # 显示进度历史
+                    if task.progress_history:
+                        _cprint(f"  {_DIM}进度历史:{_RST}")
+                        for p in task.progress_history[-5:]:  # 最近5条
+                            agent = p.get('agent', '')
+                            stage = p.get('stage', '')
+                            msg = p.get('message', '')
+                            _cprint(f"    [{stage}] {agent}: {msg}")
+                    
+                    # 提示可以使用 audit 命令
+                    _cprint(f"  {_DIM}使用 /tasks {task_id} audit 查看审计日志{_RST}")
+                else:
+                    _cprint(f"  {_DIM}(._.) 未找到任务: {task_id}{_RST}")
+                    
+            else:
+                # 列出任务
+                tasks = orchestrator.list_tasks(limit=10)
+                if not tasks:
+                    _cprint(f"  {_DIM}暂无任务记录{_RST}")
+                    return
+                
+                _cprint(f"  {_ACCENT}📋 最近任务 (共 {len(tasks)} 条){_RST}")
+                _cprint(f"  {_DIM}{'ID':<12} {'状态':<12} {'标题':<30}{_RST}")
+                _cprint(f"  {'─' * 54}")
+                
+                for task in tasks:
+                    task_id = task.task_id[:8] + "..."
+                    status = task.status.value
+                    title = (task.title or "无标题")[:28]
+                    if len(title) == 28:
+                        title += ".."
+                    
+                    # 状态图标
+                    status_icon = {
+                        TaskStatus.COMPLETED: "✅",
+                        TaskStatus.FAILED: "❌",
+                        TaskStatus.EXECUTING: "🔄",
+                        TaskStatus.DISPATCHING: "📤",
+                        TaskStatus.REVIEWING: "🔍",
+                        TaskStatus.PLANNING: "📝",
+                        TaskStatus.CLASSIFYING: "📥",
+                    }.get(task.status, "⏳")
+                    
+                    _cprint(f"  {status_icon} {task_id:<12} {status:<12} {title}")
+                
+                _cprint(f"  {_DIM}用法: /tasks [stats|<task_id>|<task_id> audit]{_RST}")
+                
+        except Exception as e:
+            _cprint(f"  {_DIM}(._.) 查询任务失败: {e}{_RST}")
+    
+    def _show_task_audit_logs(self, task_id: str):
+        """显示任务的审计日志"""
+        from multi_agent.state_manager import MultiAgentStateManager
+        
+        try:
+            state_manager = MultiAgentStateManager()
+            
+            # 尝试完整任务ID或前缀匹配
+            logs = state_manager.get_audit_logs(task_id=task_id, limit=50)
+            
+            if not logs:
+                # 尝试前缀匹配
+                all_logs = state_manager.get_audit_logs(limit=1000)
+                logs = [l for l in all_logs if l.task_id.startswith(task_id)]
+            
+            if not logs:
+                _cprint(f"  {_DIM}(._.) 未找到任务的审计日志: {task_id}{_RST}")
+                return
+            
+            _cprint(f"  {_ACCENT}📜 审计日志 - {task_id}{_RST}")
+            _cprint(f"  {_DIM}共 {len(logs)} 条记录{_RST}")
+            _cprint(f"  {'─' * 70}")
+            
+            for log in logs:
+                # 状态图标
+                status_icon = "✅" if log.status == "success" else "❌" if log.status == "failed" else "⏳"
+                
+                # 时间
+                time_str = log.created_at[11:19] if len(log.created_at) >= 19 else log.created_at
+                
+                # Agent名称
+                agent_name = log.agent_name or log.agent_id
+                
+                # 延迟
+                latency_str = f"{log.latency_ms}ms" if log.latency_ms else "-"
+                
+                # Tokens
+                tokens_str = f"{log.tokens_used}t" if log.tokens_used else "-"
+                
+                _cprint(f"  {status_icon} [{time_str}] {agent_name:<8} {log.action:<12} {latency_str:>8} {tokens_str:>8}")
+                
+                # 错误信息
+                if log.error_message:
+                    error_preview = log.error_message[:60]
+                    if len(log.error_message) > 60:
+                        error_preview += "..."
+                    _cprint(f"    {_DIM}错误: {error_preview}{_RST}")
+            
+            _cprint(f"  {'─' * 70}")
+            _cprint(f"  {_DIM}提示: 延迟单位为毫秒(ms)，token单位为个(t){_RST}")
+            
+        except Exception as e:
+            _cprint(f"  {_DIM}(._.) 查询审计日志失败: {e}{_RST}")
+    
+    def _handle_circuit_breaker_command(self, cmd: str):
+        """Handle /circuit-breaker — show or reset circuit breaker status."""
+        parts = cmd.strip().split(maxsplit=1)
+        subcommand = parts[1].strip().lower() if len(parts) > 1 else "status"
+        
+        try:
+            from multi_agent.error_handler import get_all_stats, reset_all_circuit_breakers
+            
+            if subcommand == "reset":
+                reset_all_circuit_breakers()
+                _cprint(f"  ✅ 所有熔断器已重置")
+                return
+            
+            # 显示状态
+            stats = get_all_stats()
+            
+            if not stats:
+                _cprint(f"  {_DIM}暂无 Agent 错误处理记录{_RST}")
+                return
+            
+            _cprint(f"  {_ACCENT}⚡ 熔断器状态{_RST}")
+            _cprint(f"  {'─' * 50}")
+            
+            # Agent ID 到名称的映射
+            agent_names = {
+                "taizi": "太子",
+                "zhongshu": "中书省",
+                "menxia": "门下省",
+                "shangshu": "尚书省",
+                "hubu": "户部",
+                "libu": "礼部",
+                "bingbu": "兵部",
+                "xingbu": "刑部",
+                "gongbu": "工部",
+                "libu_hr": "吏部",
+            }
+            
+            for agent_id, handler_stats in stats.items():
+                cb_stats = handler_stats.get("circuit_breaker", {})
+                state = cb_stats.get("state", "unknown")
+                total = cb_stats.get("total_requests", 0)
+                failures = cb_stats.get("total_failures", 0)
+                failure_rate = cb_stats.get("failure_rate", 0)
+                
+                # 状态图标
+                state_icons = {
+                    "closed": "🟢",
+                    "open": "🔴",
+                    "half_open": "🟡",
+                }
+                state_icon = state_icons.get(state, "⚪")
+                
+                agent_name = agent_names.get(agent_id, agent_id)
+                _cprint(f"  {state_icon} {agent_name:<8} 状态: {state:<10} 请求: {total:<5} 失败: {failures:<5} ({failure_rate:.0%})")
+            
+            _cprint(f"  {'─' * 50}")
+            _cprint(f"  {_DIM}用法: /circuit-breaker [status|reset]{_RST}")
+            _cprint(f"  {_DIM}别名: /cb{_RST}")
+            
+        except Exception as e:
+            _cprint(f"  {_DIM}(._.) 查询熔断器状态失败: {e}{_RST}")
+    
+    def _handle_events_command(self, cmd: str):
+        """Handle /events — show event bus history and statistics."""
+        parts = cmd.strip().split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        
+        try:
+            from multi_agent.event_bus import get_event_bus, EventType
+            
+            bus = get_event_bus()
+            
+            if arg == "stats":
+                # 显示统计信息
+                stats = bus.get_stats()
+                _cprint(f"  {_ACCENT}📊 事件总线统计{_RST}")
+                _cprint(f"  {'─' * 40}")
+                _cprint(f"  总发布事件: {stats.get('total_published', 0)}")
+                _cprint(f"  总投递次数: {stats.get('total_delivered', 0)}")
+                _cprint(f"  历史事件数: {stats.get('history_count', 0)}")
+                _cprint(f"  订阅者数量: {stats.get('subscriber_count', 0)}")
+                return
+            
+            # 查询事件历史
+            task_id = arg if arg else None
+            events = bus.get_history(task_id=task_id, limit=20)
+            
+            if not events:
+                _cprint(f"  {_DIM}暂无事件记录{_RST}")
+                return
+            
+            _cprint(f"  {_ACCENT}📜 事件历史 ({len(events)} 条){_RST}")
+            _cprint(f"  {'─' * 70}")
+            
+            # 事件类型图标
+            event_icons = {
+                EventType.TASK_CREATED: "🆕",
+                EventType.TASK_STARTED: "▶️",
+                EventType.TASK_COMPLETED: "✅",
+                EventType.TASK_FAILED: "❌",
+                EventType.AGENT_CALLED: "📞",
+                EventType.AGENT_COMPLETED: "✓",
+                EventType.AGENT_FAILED: "✗",
+                EventType.STAGE_CHANGE: "🔄",
+                EventType.PROGRESS_UPDATE: "📊",
+                EventType.CIRCUIT_BREAKER_TRIPPED: "⚡",
+                EventType.CIRCUIT_BREAKER_RECOVERED: "🔌",
+            }
+            
+            # Agent 名称映射
+            agent_names = {
+                "taizi": "太子",
+                "zhongshu": "中书省",
+                "menxia": "门下省",
+                "shangshu": "尚书省",
+                "hubu": "户部",
+                "libu": "礼部",
+                "bingbu": "兵部",
+                "xingbu": "刑部",
+                "gongbu": "工部",
+            }
+            
+            for event in events:
+                icon = event_icons.get(event.event_type, "📌")
+                time_str = event.timestamp[11:19] if len(event.timestamp) >= 19 else event.timestamp
+                task_str = event.task_id[:8] if len(event.task_id) > 8 else event.task_id
+                agent_name = agent_names.get(event.agent_id, event.agent_id or "-")
+                
+                # 获取消息
+                message = event.payload.get("message", "")[:30] if event.payload else ""
+                
+                _cprint(f"  {icon} [{time_str}] {task_str:<12} {agent_name:<8} {event.event_type.value:<20}")
+                if message:
+                    _cprint(f"     {_DIM}{message}{_RST}")
+            
+            _cprint(f"  {'─' * 70}")
+            _cprint(f"  {_DIM}用法: /events [stats|<task_id>]{_RST}")
+            
+        except Exception as e:
+            _cprint(f"  {_DIM}(._.) 查询事件历史失败: {e}{_RST}")
+    
+    def _should_use_multi_agent(self) -> bool:
+        """Check if multi-agent mode should be used for this conversation."""
+        try:
+            from multi_agent import MultiAgentOrchestrator
+            orchestrator = MultiAgentOrchestrator()
+            return orchestrator.is_enabled()
+        except Exception as e:
+            logging.debug(f"Failed to check multi-agent mode: {e}")
+            return False
+    
+    def _multi_agent_progress_callback(self, event: dict):
+        """进度回调函数，用于更新 TUI 显示
+        
+        Args:
+            event: 进度事件，包含 stage, agent, message 等字段
+        """
+        # 更新 spinner 文本
+        message = event.get("message", "")
+        agent_name = event.get("agent_name", "")
+        stage_name = event.get("stage_name", "")
+        
+        # 构建显示文本
+        if agent_name:
+            display_text = f"【{agent_name}】{message}"
+        else:
+            display_text = f"【三省六部】{message}"
+        
+        # 更新 TUI spinner
+        self._spinner_text = display_text
+        self._tool_start_time = 0.0
+        
+        # 触发 TUI 刷新
+        if hasattr(self, '_app') and self._app:
+            self._invalidate()
+    
+    def _run_multi_agent_conversation(
+        self,
+        user_message: str,
+        original_message: str = None,
+    ) -> dict:
+        """Run conversation through multi-agent orchestrator.
+        
+        Args:
+            user_message: The processed user message
+            original_message: The original unmodified message (for persistence)
+        
+        Returns:
+            A dict with final_response and other metadata
+        """
+        from multi_agent import MultiAgentOrchestrator
+        
+        # Create or get orchestrator with parent agent and progress callback
+        if not hasattr(self, '_multi_agent_orchestrator') or self._multi_agent_orchestrator is None:
+            self._multi_agent_orchestrator = MultiAgentOrchestrator(
+                parent_agent=self.agent,
+                progress_callback=self._multi_agent_progress_callback,
+            )
+        else:
+            # Update parent agent reference and progress callback
+            self._multi_agent_orchestrator.set_parent_agent(self.agent)
+            self._multi_agent_orchestrator.set_progress_callback(self._multi_agent_progress_callback)
+        
+        # Process message through multi-agent pipeline
+        try:
+            response = self._multi_agent_orchestrator.process_message(user_message)
+            
+            # Clear spinner after completion
+            self._spinner_text = ""
+            if hasattr(self, '_app') and self._app:
+                self._invalidate()
+            
+            # Persist the conversation
+            if original_message:
+                self._persist_multi_agent_message(original_message, response)
+            
+            return {
+                "final_response": response,
+                "messages": [],
+                "api_calls": 1,  # Approximation
+                "completed": True,
+            }
+        except Exception as e:
+            # Clear spinner on error
+            self._spinner_text = ""
+            if hasattr(self, '_app') and self._app:
+                self._invalidate()
+            
+            logging.error(f"Multi-agent conversation failed: {e}", exc_info=True)
+            return {
+                "final_response": f"多Agent模式执行出错: {e}",
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "error": str(e),
+            }
+    
+    def _persist_multi_agent_message(self, user_message: str, response: str):
+        """Persist multi-agent conversation to session history."""
+        # Add user message
+        self.conversation_history.append({
+            "role": "user",
+            "content": user_message,
+        })
+        
+        # Add assistant response
+        self.conversation_history.append({
+            "role": "assistant",
+            "content": response,
+        })
 
     def _on_reasoning(self, reasoning_text: str):
         """Callback for intermediate reasoning display during tool-call loops."""
@@ -7701,6 +8164,9 @@ class HermesCLI:
                 if _msn:
                     agent_message = _msn + "\n\n" + agent_message
                     self._pending_model_switch_note = None
+                
+                # 多Agent模式判断已移到 AIAgent 内部
+                # CLI 只需要调用 run_conversation，AIAgent 会自动判断模式
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,

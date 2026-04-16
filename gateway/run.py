@@ -641,6 +641,10 @@ class GatewayRunner:
         # Key: session_key, Value: True when a prompt is waiting for user input.
         self._update_prompt_pending: Dict[str, bool] = {}
 
+        # Track notification sources for multi-agent task notifications.
+        # Key: task_id, Value: source dict (platform, chat_id, user_id)
+        self._notification_sources: Dict[str, Dict[str, Any]] = {}
+
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
         # per-message AIAgent instances.
@@ -3136,6 +3140,9 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "tasks":
+            return await self._handle_tasks_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -5267,6 +5274,922 @@ class GatewayRunner:
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
                 return "Voice mode disabled."
+
+    async def _handle_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /tasks — list multi-agent tasks and their status."""
+        from multi_agent import MultiAgentOrchestrator, TaskStatus
+        from multi_agent.dashboard_formatter import (
+            format_task_list,
+            format_task_detail,
+            format_statistics,
+            format_audit_logs,
+            detect_platform,
+            format_active_tasks,
+            format_failed_tasks,
+            format_task_events,
+            format_workspace,
+        )
+        from multi_agent.state_manager import MultiAgentStateManager
+        from multi_agent.task_workspace import TaskWorkspace
+        import os
+        
+        args = event.get_command_args().strip()
+        parts = args.split(maxsplit=1) if args else []
+        arg = parts[0].lower() if parts else ""
+        sub_arg = parts[1].lower() if len(parts) > 1 else ""
+        
+        # 检测平台
+        platform = detect_platform(event)
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # /tasks stats [daily|weekly|agents]
+            if arg == "stats":
+                stats = orchestrator.get_statistics()
+                
+                # 扩展统计
+                if sub_arg == "daily":
+                    return self._get_daily_stats(orchestrator, platform)
+                elif sub_arg == "weekly":
+                    return self._get_weekly_stats(orchestrator, platform)
+                elif sub_arg == "agents":
+                    return self._get_agent_stats(orchestrator, platform)
+                else:
+                    return format_statistics(stats, platform)
+            
+            # /tasks active - 活跃任务
+            elif arg == "active":
+                tasks = orchestrator.list_tasks(limit=50)
+                active = [t for t in tasks if t.status in (
+                    TaskStatus.CLASSIFYING,
+                    TaskStatus.PLANNING,
+                    TaskStatus.REVIEWING,
+                    TaskStatus.DISPATCHING,
+                    TaskStatus.EXECUTING,
+                )]
+                return format_active_tasks(active, platform)
+            
+            # /tasks failed - 失败任务
+            elif arg == "failed":
+                tasks = orchestrator.list_tasks(limit=50)
+                failed = [t for t in tasks if t.status == TaskStatus.FAILED]
+                return format_failed_tasks(failed, platform)
+            
+            # /tasks archives [list|stats] - 归档管理
+            elif arg == "archives":
+                if sub_arg == "stats":
+                    return self._get_archive_stats(orchestrator, platform)
+                else:
+                    # 默认列出归档
+                    return self._list_archives(orchestrator, platform)
+            
+            # /tasks help - 帮助
+            elif arg == "help":
+                return self._get_tasks_help(platform)
+            
+            # /tasks <id> [events|workspace|audit|cancel|pause|resume]
+            elif arg and arg not in ("status", "list"):
+                task_id = arg
+                
+                # 子命令
+                if sub_arg == "audit":
+                    return await self._handle_tasks_audit(task_id, platform)
+                elif sub_arg == "events":
+                    return await self._handle_tasks_events(task_id, platform)
+                elif sub_arg == "workspace":
+                    return await self._handle_tasks_workspace(task_id, platform)
+                elif sub_arg == "cancel":
+                    return await self._handle_tasks_cancel(task_id, platform, event)
+                elif sub_arg == "pause":
+                    return await self._handle_tasks_pause(task_id, platform, event)
+                elif sub_arg == "resume":
+                    return await self._handle_tasks_resume(task_id, platform, event)
+                elif sub_arg == "confirm":
+                    # /tasks <id> confirm <decision>
+                    decision = parts[3] if len(parts) > 3 else "continue"
+                    return await self._handle_tasks_confirm(task_id, decision, platform, event)
+                elif sub_arg == "blocked":
+                    return await self._handle_tasks_blocked(task_id, platform)
+                elif sub_arg == "archive":
+                    # /tasks <id> archive [result]
+                    result = parts[3] if len(parts) > 3 else "success"
+                    return await self._handle_tasks_archive(task_id, result, platform)
+                elif sub_arg == "export":
+                    # /tasks <id> export [format]
+                    fmt = parts[3] if len(parts) > 3 else "json"
+                    return await self._handle_tasks_export(task_id, fmt, platform)
+                
+                # 查询任务详情
+                task = orchestrator.get_task(task_id)
+                if task:
+                    return format_task_detail(task, platform)
+                else:
+                    # 尝试前缀匹配
+                    tasks = orchestrator.list_tasks(limit=100)
+                    matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                    if matched:
+                        return format_task_detail(matched[0], platform)
+                    return f"未找到任务: {task_id}"
+            
+            # /tasks - 列出任务
+            else:
+                tasks = orchestrator.list_tasks(limit=10)
+                return format_task_list(tasks, platform)
+                
+        except Exception as e:
+            logger.exception("Failed to handle /tasks command")
+            return f"查询任务失败: {e}"
+
+    def _get_tasks_help(self, platform: str) -> str:
+        """返回帮助信息"""
+        if platform == "feishu":
+            return """**📋 /tasks 命令帮助**
+
+**查询命令**
+- `/tasks` - 列出最近任务
+- `/tasks stats` - 显示统计面板
+- `/tasks active` - 活跃任务列表
+- `/tasks failed` - 失败任务列表
+
+**任务详情**
+- `/tasks <id>` - 查看任务详情
+- `/tasks <id> events` - 任务事件流
+- `/tasks <id> audit` - 审计日志
+- `/tasks <id> workspace` - 工作空间
+
+**任务干预**
+- `/tasks <id> cancel` - 取消任务
+- `/tasks <id> pause` - 暂停任务
+- `/tasks <id> resume` - 恢复任务
+
+**阻塞任务**
+- `/tasks <id> blocked` - 查看阻塞状态
+- `/tasks <id> confirm <选项>` - 确认阻塞任务
+
+**归档管理**
+- `/tasks archives` - 列出归档
+- `/tasks archives stats` - 归档统计
+- `/tasks <id> archive [result]` - 归档任务
+- `/tasks <id> export [format]` - 导出任务
+
+**统计报告**
+- `/tasks stats daily` - 今日统计
+- `/tasks stats weekly` - 本周统计
+- `/tasks stats agents` - Agent排行"""
+        else:
+            return """【/tasks 命令帮助】
+
+查询命令:
+/tasks - 最近任务
+/tasks stats - 统计面板
+/tasks active - 活跃任务
+/tasks failed - 失败任务
+
+任务详情:
+/tasks <id> - 任务详情
+/tasks <id> events - 事件流
+/tasks <id> audit - 审计日志
+/tasks <id> workspace - 工作空间
+
+任务干预:
+/tasks <id> cancel - 取消任务
+/tasks <id> pause - 暂停任务
+/tasks <id> resume - 恢复任务
+
+阻塞任务:
+/tasks <id> blocked - 查看阻塞状态
+/tasks <id> confirm <选项> - 确认阻塞任务
+
+归档管理:
+/tasks archives - 列出归档
+/tasks archives stats - 归档统计
+/tasks <id> archive [result] - 归档任务
+/tasks <id> export [format] - 导出任务
+
+统计报告:
+/tasks stats daily - 今日
+/tasks stats weekly - 本周"""
+
+    def _get_daily_stats(self, orchestrator, platform: str) -> str:
+        """获取今日统计"""
+        from datetime import datetime
+        from multi_agent.state_manager import MultiAgentStateManager
+        
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        try:
+            state_manager = MultiAgentStateManager()
+            logs = state_manager.get_audit_logs(limit=1000)
+            
+            # 过滤今日日志
+            today_logs = [l for l in logs if l.created_at.startswith(today)]
+            
+            # 统计
+            new_tasks = len(set(l.task_id for l in today_logs if l.action == "task_created"))
+            completed_tasks = len(set(l.task_id for l in today_logs if l.action == "task_completed"))
+            failed_tasks = len(set(l.task_id for l in today_logs if l.action == "task_failed"))
+            tokens = sum(l.tokens_used or 0 for l in today_logs)
+            
+            # 成功率
+            total = completed_tasks + failed_tasks
+            success_rate = round(completed_tasks / total * 100) if total > 0 else 0
+            
+            # Agent 统计
+            agent_calls = {}
+            for l in today_logs:
+                agent = l.agent_name or l.agent_id
+                if agent:
+                    agent_calls[agent] = agent_calls.get(agent, 0) + 1
+            
+            top_agents = sorted(agent_calls.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_agents = [{"name": a, "calls": c} for a, c in top_agents]
+            
+            stats = {
+                "new_tasks": new_tasks,
+                "completed_tasks": completed_tasks,
+                "active_tasks": 0,  # 需要查询
+                "failed_tasks": failed_tasks,
+                "success_rate": success_rate,
+                "tokens_used": tokens,
+                "top_agents": top_agents,
+            }
+            
+            from multi_agent.dashboard_formatter import format_daily_report
+            return format_daily_report(stats, platform)
+            
+        except Exception as e:
+            logger.exception("Failed to get daily stats")
+            return f"获取今日统计失败: {e}"
+
+    def _get_weekly_stats(self, orchestrator, platform: str) -> str:
+        """获取本周统计"""
+        from datetime import datetime, timedelta
+        from multi_agent.state_manager import MultiAgentStateManager
+        
+        try:
+            state_manager = MultiAgentStateManager()
+            logs = state_manager.get_audit_logs(limit=5000)
+            
+            # 计算本周开始日期
+            today = datetime.now()
+            week_start = today - timedelta(days=today.weekday())
+            week_start_str = week_start.strftime("%Y-%m-%d")
+            
+            # 过滤本周日志
+            week_logs = [l for l in logs if l.created_at >= week_start_str]
+            
+            # 统计
+            new_tasks = len(set(l.task_id for l in week_logs if l.action == "task_created"))
+            completed_tasks = len(set(l.task_id for l in week_logs if l.action == "task_completed"))
+            failed_tasks = len(set(l.task_id for l in week_logs if l.action == "task_failed"))
+            tokens = sum(l.tokens_used or 0 for l in week_logs)
+            
+            # 成功率
+            total = completed_tasks + failed_tasks
+            success_rate = round(completed_tasks / total * 100) if total > 0 else 0
+            
+            # Agent 统计
+            agent_stats = {}
+            for l in week_logs:
+                agent = l.agent_name or l.agent_id
+                if agent:
+                    if agent not in agent_stats:
+                        agent_stats[agent] = {"calls": 0, "tokens": 0, "success": 0, "total": 0}
+                    agent_stats[agent]["calls"] += 1
+                    agent_stats[agent]["tokens"] += l.tokens_used or 0
+                    if l.status == "success":
+                        agent_stats[agent]["success"] += 1
+                    agent_stats[agent]["total"] += 1
+            
+            top_agents = []
+            for agent, stats in sorted(agent_stats.items(), key=lambda x: x[1]["calls"], reverse=True)[:5]:
+                sr = round(stats["success"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                top_agents.append({
+                    "name": agent,
+                    "calls": stats["calls"],
+                    "tokens": stats["tokens"],
+                    "success_rate": sr,
+                })
+            
+            stats = {
+                "new_tasks": new_tasks,
+                "completed_tasks": completed_tasks,
+                "success_rate": success_rate,
+                "tokens_used": tokens,
+                "top_agents": top_agents,
+            }
+            
+            from multi_agent.dashboard_formatter import format_weekly_report
+            return format_weekly_report(stats, platform)
+            
+        except Exception as e:
+            logger.exception("Failed to get weekly stats")
+            return f"获取本周统计失败: {e}"
+
+    def _get_agent_stats(self, orchestrator, platform: str) -> str:
+        """获取 Agent 排行"""
+        from multi_agent.state_manager import MultiAgentStateManager
+        
+        try:
+            state_manager = MultiAgentStateManager()
+            logs = state_manager.get_audit_logs(limit=1000)
+            
+            # Agent 统计
+            agent_stats = {}
+            for l in logs:
+                agent = l.agent_name or l.agent_id
+                if agent:
+                    if agent not in agent_stats:
+                        agent_stats[agent] = {"calls": 0, "tokens": 0, "success": 0, "total": 0}
+                    agent_stats[agent]["calls"] += 1
+                    agent_stats[agent]["tokens"] += l.tokens_used or 0
+                    if l.status == "success":
+                        agent_stats[agent]["success"] += 1
+                    agent_stats[agent]["total"] += 1
+            
+            # 排序
+            sorted_agents = sorted(agent_stats.items(), key=lambda x: x[1]["calls"], reverse=True)[:10]
+            
+            if platform == "feishu":
+                lines = [
+                    "**🏆 Agent 排行榜**",
+                    "",
+                    "| 排名 | Agent | 调用 | Token | 成功率 |",
+                    "|------|-------|------|-------|--------|",
+                ]
+                medals = ["🥇", "🥈", "🥉"]
+                for i, (agent, stats) in enumerate(sorted_agents):
+                    medal = medals[i] if i < 3 else ""
+                    sr = round(stats["success"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                    lines.append(f"| {medal} | {agent} | {stats['calls']} | {stats['tokens']:,} | {sr}% |")
+            else:
+                lines = ["【Agent 排行榜】", ""]
+                medals = ["🥇", "🥈", "🥉"]
+                for i, (agent, stats) in enumerate(sorted_agents):
+                    medal = medals[i] if i < 3 else ""
+                    sr = round(stats["success"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                    lines.append(f"{medal} {agent} - {stats['calls']}次 - {sr}%")
+            
+            return "\n".join(lines)
+            
+        except Exception as e:
+            logger.exception("Failed to get agent stats")
+            return f"获取 Agent 统计失败: {e}"
+
+    async def _handle_tasks_events(self, task_id: str, platform: str) -> str:
+        """显示任务事件流"""
+        from multi_agent import MultiAgentOrchestrator
+        from multi_agent.dashboard_formatter import format_task_events
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            task = orchestrator.get_task(task_id)
+            
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                else:
+                    return f"未找到任务: {task_id}"
+            
+            # 从 progress_history 构建事件列表
+            events = []
+            if task.progress_history:
+                for p in task.progress_history:
+                    events.append({
+                        "time": p.get("time", ""),
+                        "type": p.get("stage", ""),
+                        "message": f"{p.get('agent', '')}: {p.get('message', '')}",
+                    })
+            
+            return format_task_events(events, task.task_id[:8], platform)
+            
+        except Exception as e:
+            logger.exception("Failed to get task events")
+            return f"获取事件流失败: {e}"
+
+    async def _handle_tasks_workspace(self, task_id: str, platform: str) -> str:
+        """显示工作空间"""
+        from multi_agent import MultiAgentOrchestrator
+        from multi_agent.dashboard_formatter import format_workspace
+        from multi_agent.task_workspace import TaskWorkspace
+        import os
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            task = orchestrator.get_task(task_id)
+            
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                else:
+                    return f"未找到任务: {task_id}"
+            
+            # 获取工作空间路径
+            workspace_path = task.workspace_path if hasattr(task, 'workspace_path') and task.workspace_path else ""
+            
+            if not workspace_path:
+                # 尝试默认路径
+                from hermes_constants import get_hermes_home
+                workspace_path = f"{get_hermes_home()}/tasks/{task.task_id}"
+            
+            # 列出文件
+            files = []
+            if os.path.exists(workspace_path):
+                for root, dirs, filenames in os.walk(workspace_path):
+                    for f in filenames:
+                        rel_path = os.path.relpath(os.path.join(root, f), workspace_path)
+                        files.append(rel_path)
+            
+            if not files:
+                files = ["(暂无文件)"]
+            
+            return format_workspace(workspace_path, files, task.task_id[:8], platform)
+            
+        except Exception as e:
+            logger.exception("Failed to get workspace")
+            return f"获取工作空间失败: {e}"
+
+    async def _handle_tasks_audit(self, task_id: str, platform: str) -> str:
+        """显示任务的审计日志"""
+        from multi_agent.state_manager import MultiAgentStateManager
+        from multi_agent.dashboard_formatter import format_audit_logs
+        
+        try:
+            state_manager = MultiAgentStateManager()
+            
+            # 尝试完整任务ID或前缀匹配
+            logs = state_manager.get_audit_logs(task_id=task_id, limit=50)
+            
+            if not logs:
+                # 尝试前缀匹配
+                all_logs = state_manager.get_audit_logs(limit=1000)
+                logs = [l for l in all_logs if l.task_id.startswith(task_id)]
+            
+            return format_audit_logs(logs, task_id, platform)
+            
+        except Exception as e:
+            logger.exception("Failed to get audit logs")
+            return f"查询审计日志失败: {e}"
+    
+    async def _handle_tasks_cancel(self, task_id: str, platform: str, event) -> str:
+        """取消任务"""
+        from multi_agent import MultiAgentOrchestrator, TaskStatus
+        from multi_agent.dashboard_formatter import detect_platform
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 先检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 获取操作者信息
+            by = "user"
+            if hasattr(event, 'sender_id'):
+                by = event.sender_id or "user"
+            
+            # 执行取消
+            result = orchestrator.cancel_task(task_id, reason="用户取消", by=by)
+            
+            if result.get("success"):
+                if platform == "feishu":
+                    return f"✅ **任务已取消**\n\n任务ID: `{task_id}`\n状态: 已取消"
+                else:
+                    return f"✅ 任务已取消\n\n任务ID: {task_id}\n状态: 已取消"
+            else:
+                return f"❌ 取消失败: {result.get('message', '未知错误')}"
+                
+        except Exception as e:
+            logger.exception("Failed to cancel task")
+            return f"取消任务失败: {e}"
+    
+    async def _handle_tasks_pause(self, task_id: str, platform: str, event) -> str:
+        """暂停任务"""
+        from multi_agent import MultiAgentOrchestrator, TaskStatus
+        from multi_agent.dashboard_formatter import detect_platform
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 先检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 获取操作者信息
+            by = "user"
+            if hasattr(event, 'sender_id'):
+                by = event.sender_id or "user"
+            
+            # 执行暂停
+            result = orchestrator.pause_task(task_id, reason="用户暂停", by=by)
+            
+            if result.get("success"):
+                previous_status = task.status if hasattr(task, 'status') else "unknown"
+                if platform == "feishu":
+                    return f"⏸️ **任务已暂停**\n\n任务ID: `{task_id}`\n原状态: {previous_status}\n\n使用 `/tasks {task_id[:8]} resume` 恢复任务"
+                else:
+                    return f"⏸️ 任务已暂停\n\n任务ID: {task_id}\n原状态: {previous_status}\n\n使用 /tasks {task_id[:8]} resume 恢复任务"
+            else:
+                return f"❌ 暂停失败: {result.get('message', '未知错误')}"
+                
+        except Exception as e:
+            logger.exception("Failed to pause task")
+            return f"暂停任务失败: {e}"
+    
+    async def _handle_tasks_resume(self, task_id: str, platform: str, event) -> str:
+        """恢复暂停的任务"""
+        from multi_agent import MultiAgentOrchestrator, TaskStatus
+        from multi_agent.dashboard_formatter import detect_platform
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 先检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 检查任务是否处于暂停状态
+            if task.status != "paused":
+                if platform == "feishu":
+                    return f"❌ 任务状态为 `{task.status}`，无法恢复（只能在暂停状态恢复）"
+                else:
+                    return f"❌ 任务状态为 {task.status}，无法恢复（只能在暂停状态恢复）"
+            
+            # 获取操作者信息
+            by = "user"
+            if hasattr(event, 'sender_id'):
+                by = event.sender_id or "user"
+            
+            # 执行恢复
+            result = orchestrator.resume_task(task_id, by=by)
+            
+            if result.get("success"):
+                resumed_to = result.get("task").status if result.get("task") else "unknown"
+                if platform == "feishu":
+                    return f"▶️ **任务已恢复**\n\n任务ID: `{task_id}`\n恢复到状态: {resumed_to}"
+                else:
+                    return f"▶️ 任务已恢复\n\n任务ID: {task_id}\n恢复到状态: {resumed_to}"
+            else:
+                return f"❌ 恢复失败: {result.get('message', '未知错误')}"
+                
+        except Exception as e:
+            logger.exception("Failed to resume task")
+            return f"恢复任务失败: {e}"
+    
+    async def _handle_tasks_confirm(self, task_id: str, decision: str, platform: str, event) -> str:
+        """确认阻塞任务"""
+        from multi_agent import MultiAgentOrchestrator
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 先检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                # 尝试前缀匹配
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 检查任务是否处于阻塞状态
+            if task.status != "blocked":
+                if platform == "feishu":
+                    return f"❌ 任务状态为 `{task.status}`，不在阻塞状态"
+                else:
+                    return f"❌ 任务状态为 {task.status}，不在阻塞状态"
+            
+            # 获取操作者信息
+            by = "user"
+            if hasattr(event, 'sender_id'):
+                by = event.sender_id or "user"
+            
+            # 执行解除阻塞
+            result = orchestrator.unblock_task(task_id, user_decision=decision, by=by)
+            
+            if result.get("success"):
+                new_status = result.get("new_status", "unknown")
+                if new_status == "cancelled":
+                    if platform == "feishu":
+                        return f"✅ **任务已取消**\n\n任务ID: `{task_id}`\n决策: {decision}"
+                    else:
+                        return f"✅ 任务已取消\n\n任务ID: {task_id}\n决策: {decision}"
+                else:
+                    if platform == "feishu":
+                        return f"✅ **任务已继续**\n\n任务ID: `{task_id}`\n决策: {decision}\n恢复到状态: {new_status}"
+                    else:
+                        return f"✅ 任务已继续\n\n任务ID: {task_id}\n决策: {decision}\n恢复到状态: {new_status}"
+            else:
+                return f"❌ 确认失败: {result.get('message', '未知错误')}"
+                
+        except Exception as e:
+            logger.exception("Failed to confirm blocked task")
+            return f"确认任务失败: {e}"
+    
+    async def _handle_tasks_blocked(self, task_id: str, platform: str) -> str:
+        """查看任务阻塞状态"""
+        from multi_agent import MultiAgentOrchestrator
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 获取阻塞状态
+            blocked_status = orchestrator.get_blocked_status(task_id)
+            
+            if not blocked_status.get("is_blocked"):
+                if platform == "feishu":
+                    return f"任务 `{task_id}` 当前不在阻塞状态"
+                else:
+                    return f"任务 {task_id} 当前不在阻塞状态"
+            
+            info = blocked_status.get("blocked_info", {})
+            options = blocked_status.get("options", [])
+            
+            # 构建响应
+            if platform == "feishu":
+                msg = f"⚠️ **任务阻塞状态**\n\n"
+                msg += f"任务ID: `{task_id}`\n"
+                msg += f"阻塞原因: {info.get('reason', '未知')}\n"
+                msg += f"阻塞方: {info.get('by', '未知')}\n"
+                msg += f"阻塞时间: {info.get('at', '未知')}\n"
+                if options:
+                    msg += "\n**可选项:**\n"
+                    for opt in options:
+                        msg += f"- [{opt.get('id', '?')}] {opt.get('label', '未知')}\n"
+                msg += f"\n使用 `/tasks {task_id[:8]} confirm <选项>` 确认"
+            else:
+                msg = f"⚠️ 任务阻塞状态\n\n"
+                msg += f"任务ID: {task_id}\n"
+                msg += f"阻塞原因: {info.get('reason', '未知')}\n"
+                msg += f"阻塞方: {info.get('by', '未知')}\n"
+                msg += f"阻塞时间: {info.get('at', '未知')}\n"
+                if options:
+                    msg += "\n可选项:\n"
+                    for opt in options:
+                        msg += f"  [{opt.get('id', '?')}] {opt.get('label', '未知')}\n"
+                msg += f"\n使用 /tasks {task_id[:8]} confirm <选项> 确认"
+            
+            return msg
+                
+        except Exception as e:
+            logger.exception("Failed to get blocked status")
+            return f"查询阻塞状态失败: {e}"
+    
+    async def _handle_tasks_archive(self, task_id: str, result: str, platform: str) -> str:
+        """归档任务"""
+        from multi_agent import MultiAgentOrchestrator
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 检查任务是否存在
+            task = orchestrator.get_task(task_id)
+            if not task:
+                tasks = orchestrator.list_tasks(limit=100)
+                matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                if matched:
+                    task = matched[0]
+                    task_id = task.task_id
+                else:
+                    return f"❌ 未找到任务: {task_id}"
+            
+            # 归档任务
+            archive_result = orchestrator.archive_task(task_id, result)
+            
+            if archive_result.get("success"):
+                archive_id = archive_result.get("archive_id")
+                if platform == "feishu":
+                    return f"✅ 任务已归档\n\n归档ID: `{archive_id}`\n任务ID: `{task_id}`\n结果: {result}"
+                else:
+                    return f"✅ 任务已归档\n\n归档ID: {archive_id}\n任务ID: {task_id}\n结果: {result}"
+            else:
+                return f"❌ 归档失败: {archive_result.get('error', '未知错误')}"
+                
+        except Exception as e:
+            logger.exception("Failed to archive task")
+            return f"归档任务失败: {e}"
+    
+    async def _handle_tasks_export(self, task_id: str, format: str, platform: str) -> str:
+        """导出任务"""
+        from multi_agent import MultiAgentOrchestrator
+        import json
+        
+        try:
+            orchestrator = MultiAgentOrchestrator()
+            
+            # 导出任务
+            export_result = orchestrator.export_archive(task_id=task_id, format=format)
+            
+            if export_result.get("success"):
+                content = export_result.get("content", "")
+                archive_id = export_result.get("archive_id", "")
+                
+                if format == "markdown":
+                    if platform == "feishu":
+                        return f"📄 **任务导出 (Markdown)**\n\n归档ID: `{archive_id}`\n\n{content[:3000]}{'...' if len(content) > 3000 else ''}"
+                    else:
+                        return f"📄 任务导出 (Markdown)\n\n归档ID: {archive_id}\n\n{content[:3000]}{'...' if len(content) > 3000 else ''}"
+                else:
+                    # JSON 格式
+                    if platform == "feishu":
+                        return f"```json\n{content[:2000]}{'...' if len(content) > 2000 else ''}\n```"
+                    else:
+                        return f"JSON 导出:\n{content[:2000]}{'...' if len(content) > 2000 else ''}"
+            else:
+                # 如果没有归档记录，尝试从任务导出
+                task = orchestrator.get_task(task_id)
+                if not task:
+                    tasks = orchestrator.list_tasks(limit=100)
+                    matched = [t for t in tasks if t.task_id.startswith(task_id)]
+                    if matched:
+                        task = matched[0]
+                    else:
+                        return f"❌ 未找到任务: {task_id}"
+                
+                # 导出未归档任务
+                task_data = {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "message_type": task.message_type,
+                    "original_message": task.original_message,
+                    "classification": task.classification,
+                    "plan": task.plan,
+                    "status": task.status.value if hasattr(task.status, 'value') else str(task.status),
+                    "created_at": task.created_at,
+                }
+                
+                if format == "json":
+                    content = json.dumps(task_data, ensure_ascii=False, indent=2)
+                    if platform == "feishu":
+                        return f"```json\n{content[:2000]}{'...' if len(content) > 2000 else ''}\n```"
+                    else:
+                        return f"JSON 导出:\n{content[:2000]}{'...' if len(content) > 2000 else ''}"
+                else:
+                    # Markdown
+                    md = f"# 任务导出\n\n"
+                    md += f"- **任务ID**: {task.task_id}\n"
+                    md += f"- **标题**: {task.title}\n"
+                    md += f"- **类型**: {task.message_type}\n"
+                    md += f"- **状态**: {task.status.value if hasattr(task.status, 'value') else task.status}\n"
+                    md += f"- **创建时间**: {task.created_at}\n\n"
+                    if task.classification:
+                        md += f"## 分类\n```\n{task.classification}\n```\n\n"
+                    if task.plan:
+                        md += f"## 计划\n```\n{task.plan}\n```\n"
+                    
+                    if platform == "feishu":
+                        return f"📄 **任务导出**\n\n{md[:3000]}{'...' if len(md) > 3000 else ''}"
+                    else:
+                        return f"📄 任务导出\n\n{md[:3000]}{'...' if len(md) > 3000 else ''}"
+                        
+        except Exception as e:
+            logger.exception("Failed to export task")
+            return f"导出任务失败: {e}"
+    
+    def _list_archives(self, orchestrator, platform: str) -> str:
+        """列出归档"""
+        from datetime import datetime
+        
+        try:
+            archives = orchestrator.list_archives(limit=20)
+            
+            if not archives:
+                return "📭 暂无归档记录"
+            
+            if platform == "feishu":
+                msg = "📦 **归档列表**\n\n"
+                for a in archives:
+                    msg += f"- `{a.get('archive_id', '?')[:8]}` | {a.get('title', '无标题')[:20]} | {a.get('result', '?')} | {a.get('archived_at', '?')[:10]}\n"
+                msg += f"\n共 {len(archives)} 条归档"
+            else:
+                msg = "📦 归档列表\n\n"
+                for a in archives:
+                    msg += f"  {a.get('archive_id', '?')[:8]} | {a.get('title', '无标题')[:20]} | {a.get('result', '?')} | {a.get('archived_at', '?')[:10]}\n"
+                msg += f"\n共 {len(archives)} 条归档"
+            
+            return msg
+                
+        except Exception as e:
+            logger.exception("Failed to list archives")
+            return f"列出归档失败: {e}"
+    
+    def _get_archive_stats(self, orchestrator, platform: str) -> str:
+        """获取归档统计"""
+        try:
+            stats = orchestrator.get_archive_statistics()
+            
+            if platform == "feishu":
+                msg = "📊 **归档统计**\n\n"
+                msg += f"- 总归档数: **{stats.get('total_archives', 0)}**\n"
+                msg += f"- 成功: {stats.get('success_count', 0)}\n"
+                msg += f"- 失败: {stats.get('failed_count', 0)}\n"
+                msg += f"- 取消: {stats.get('cancelled_count', 0)}\n"
+                msg += f"- 今日归档: {stats.get('today_count', 0)}\n"
+                msg += f"- 本周归档: {stats.get('week_count', 0)}\n"
+            else:
+                msg = "📊 归档统计\n\n"
+                msg += f"  总归档数: {stats.get('total_archives', 0)}\n"
+                msg += f"  成功: {stats.get('success_count', 0)}\n"
+                msg += f"  失败: {stats.get('failed_count', 0)}\n"
+                msg += f"  取消: {stats.get('cancelled_count', 0)}\n"
+                msg += f"  今日归档: {stats.get('today_count', 0)}\n"
+                msg += f"  本周归档: {stats.get('week_count', 0)}\n"
+            
+            return msg
+                
+        except Exception as e:
+            logger.exception("Failed to get archive stats")
+            return f"获取归档统计失败: {e}"
+
+    async def _send_multi_agent_notification_async(
+        self,
+        notification_data: Dict[str, Any],
+        source,
+        thread_metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        发送多Agent推送通知（异步版本）
+        
+        Args:
+            notification_data: 通知数据，包含 task_id, type, title 等
+            source: SessionSource 对象，包含平台和 chat_id 信息
+            thread_metadata: 线程元数据（可选）
+        """
+        notification_type = notification_data.get("type", "")
+        
+        # 获取平台适配器
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning(f"未找到平台 {source.platform} 的适配器，跳过推送")
+            return
+        
+        # 检测平台类型
+        platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        platform_type = "feishu" if "feishu" in platform_name.lower() or "lark" in platform_name.lower() else "weixin"
+        
+        # 格式化通知消息
+        from multi_agent.dashboard_formatter import format_notification
+        message = format_notification(notification_type, notification_data, platform_type)
+        
+        if not message:
+            logger.debug(f"通知类型 {notification_type} 无需发送消息")
+            return
+        
+        # 发送消息
+        try:
+            if hasattr(adapter, "send"):
+                await adapter.send(source.chat_id, message, metadata=thread_metadata)
+            elif hasattr(adapter, "send_message"):
+                await adapter.send_message(source.chat_id, message)
+            else:
+                logger.warning(f"适配器 {type(adapter).__name__} 不支持发送消息")
+        except Exception as e:
+            logger.warning(f"推送通知发送失败: {e}")
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -8709,6 +9632,28 @@ class GatewayRunner:
                 if _pdc is not None:
                     _pdc[session_key] = _release_bg_review_messages
 
+            # Set up multi-agent notification callback for push notifications
+            # This allows the orchestrator to send key stage notifications to the user
+            def _multi_agent_notification_callback(notification_data: dict) -> None:
+                """Sync callback for multi-agent notifications (runs in thread pool)."""
+                try:
+                    # Get the event loop from the outer scope
+                    _cb_loop = _loop_for_step
+                    if not _cb_loop:
+                        return
+                    
+                    # Schedule the async notification send on the main event loop
+                    asyncio.run_coroutine_threadsafe(
+                        self._send_multi_agent_notification_async(
+                            notification_data, source, _status_thread_metadata
+                        ),
+                        _cb_loop,
+                    )
+                except Exception as _e:
+                    logger.debug("multi_agent_notification_callback error: %s", _e)
+            
+            agent._notification_callback = _multi_agent_notification_callback
+
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
@@ -9710,6 +10655,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         sync_skills(quiet=True)
     except Exception:
         pass
+
+    # Register multi-agent scheduled reports (daily/weekly)
+    try:
+        from multi_agent.report_scheduler import register_multi_agent_reports
+        register_multi_agent_reports()
+    except Exception as e:
+        logger.debug("Failed to register multi-agent reports: %s", e)
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).
